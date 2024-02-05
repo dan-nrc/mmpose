@@ -131,3 +131,4 @@ docs/**/modelzoo.md
 *.pth
 
 *.DS_Store
+*.mp4

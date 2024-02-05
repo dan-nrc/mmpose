@@ -244,6 +244,7 @@ class PoseLocalVisualizer(OpencvBackendVisualizer):
                              instances: InstanceData,
                              kpt_thr: float = 0.3,
                              show_kpt_idx: bool = False,
+                             hide_kpts: np.ndarray = None,
                              skeleton_style: str = 'mmpose'):
         """Draw keypoints and skeletons (optional) of GT or prediction.
 
@@ -277,6 +278,8 @@ class PoseLocalVisualizer(OpencvBackendVisualizer):
                 keypoints_visible = instances.keypoints_visible
             else:
                 keypoints_visible = np.ones(keypoints.shape[:-1])
+            if not (hide_kpts is None):
+                keypoints_visible[:,hide_kpts] = 0
 
             for kpts, visible in zip(keypoints, keypoints_visible):
                 kpts = np.array(kpts, copy=False)
@@ -577,6 +580,7 @@ class PoseLocalVisualizer(OpencvBackendVisualizer):
                        draw_heatmap: bool = False,
                        draw_bbox: bool = False,
                        show_kpt_idx: bool = False,
+                       hide_kpts: np.ndarray = None,
                        skeleton_style: str = 'mmpose',
                        show: bool = False,
                        wait_time: float = 0,
@@ -652,7 +656,7 @@ class PoseLocalVisualizer(OpencvBackendVisualizer):
             if 'pred_instances' in data_sample:
                 pred_img_data = self._draw_instances_kpts(
                     pred_img_data, data_sample.pred_instances, kpt_thr,
-                    show_kpt_idx, skeleton_style)
+                    show_kpt_idx, hide_kpts, skeleton_style)
                 if draw_bbox:
                     pred_img_data = self._draw_instances_bbox(
                         pred_img_data, data_sample.pred_instances)
