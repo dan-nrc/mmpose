@@ -46,7 +46,7 @@ class HeadPoseEstimator:
             Tuple: (rotation_vector, translation_vector) as pose.
         """
 
-        (_, rotation_vector, translation_vector) = cv2.solvePnP(
+        (_, rotation_vector, translation_vector, _) = cv2.solvePnPRansac(
                 self.model_points_68, points, self.camera_matrix, self.dist_coeefs)
 
         # (_, rotation_vector, translation_vector) = cv2.solvePnP(

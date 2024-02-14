@@ -1,5 +1,4 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-import time
 from argparse import ArgumentParser
 from mmdet.evaluation.functional import bbox_overlaps
 import cv2
@@ -10,12 +9,12 @@ import numpy as np
 from mmcv.transforms import Compose
 from mmpose.apis import inference_topdown
 from mmpose.apis import init_model as init_pose_estimator
-from mmpose.evaluation.functional import nms
 from mmpose.registry import VISUALIZERS
 from mmpose.structures import merge_data_samples, split_instances
 from mmpose.utils import adapt_mmdet_pipeline
-from facetorch import FaceAnalyzer
-from omegaconf import OmegaConf
+from pose_estimation import HeadPoseEstimator
+from utils import *
+import math
 
 try:
     from mmdet.apis import inference_detector, init_detector
@@ -24,44 +23,7 @@ except (ImportError, ModuleNotFoundError):
     has_mmdet = False
 
 from tracker import BYTETracker
-from math import cos, sin
 
-def draw_axis(img, yaw, pitch, roll, tdx=None, tdy=None, size = 100):
-
-    pitch = pitch * np.pi / 180
-    yaw = -(yaw * np.pi / 180)
-    roll = roll * np.pi / 180
-
-    if tdx != None and tdy != None:
-        tdx = tdx
-        tdy = tdy
-    else:
-        height, width = img.shape[:2]
-        tdx = width / 2
-        tdy = height / 2
-
-    # X-Axis pointing to right. drawn in red
-    x1 = size * (cos(yaw) * cos(roll)) + tdx
-    y1 = size * (cos(pitch) * sin(roll) + cos(roll) * sin(pitch) * sin(yaw)) + tdy
-
-    # Y-Axis | drawn in green
-    #        v
-    x2 = size * (-cos(yaw) * sin(roll)) + tdx
-    y2 = size * (cos(pitch) * cos(roll) - sin(pitch) * sin(yaw) * sin(roll)) + tdy
-
-    # Z-Axis (out of the screen) drawn in blue
-    x3 = size * (sin(yaw)) + tdx
-    y3 = size * (-cos(yaw) * sin(pitch)) + tdy
-
-    cv2.line(img, (int(tdx), int(tdy)), (int(x1),int(y1)),(0,0,255),4)
-    cv2.line(img, (int(tdx), int(tdy)), (int(x2),int(y2)),(0,255,0),4)
-    cv2.line(img, (int(tdx), int(tdy)), (int(x3),int(y3)),(255,0,0),4)
-
-    return img
-
-def in_bbox(rect,pt):
-    logic = rect[0] < pt[0] < rect[2] and rect[1] < pt[1] < rect[3]
-    return logic
 
 def parse_args():
     """Visualize the demo images.
@@ -73,15 +35,14 @@ def parse_args():
     parser.add_argument('det_checkpoint', help='Checkpoint file for detection')
     parser.add_argument('pose_config', help='Config file for pose')
     parser.add_argument('pose_checkpoint', help='Checkpoint file for pose')
-    parser.add_argument('face_config', help='Config file for face det and pose')
     parser.add_argument('video', help='Video file')
     parser.add_argument(
-        "--start_second", 
+        "--start-second", 
         type=float, 
         default=0.0, 
         help="ts of video start")
     parser.add_argument(
-        '--skip_seconds', 
+        '--skip-seconds', 
         type=float, 
         default=1.0, 
         help='number of seconds between frames to process')
@@ -91,16 +52,11 @@ def parse_args():
         default=False,
         help='whether to show img')
     parser.add_argument(
-        '--wait_time',
-        type=int,
-        default=1,
-        help='The interval of show (s), 0 is block')
-    parser.add_argument(
-        '--out_video', 
+        '--out-video', 
         type=str, 
         help='Output video file')
     parser.add_argument(
-        '--out_preds',
+        '--out-preds',
         type=str,
         help='whether to save predicted results')
     parser.add_argument(
@@ -115,29 +71,29 @@ def parse_args():
         help='Visualizing keypoint thresholds')
     # tracking args
     parser.add_argument(
-        "--track_thresh", 
+        "--track-thresh", 
         type=float, 
         default=0.3, 
         help="tracking confidence threshold")
     parser.add_argument(
-        "--track_buffer", 
+        "--track-buffer", 
         type=int, 
         default=30, 
         help="the frames for keep lost tracks")
     parser.add_argument(
-        "--match_thresh", 
+        "--match-thresh", 
         type=float, 
         default=0.8, 
         help="matching threshold for tracking")
     parser.add_argument(
-        '--min_overlap', 
+        '--min-overlap', 
         type=float, 
-        default=0.3, 
+        default=0.2, 
         help='min overlap with seat to count as sitting')
     parser.add_argument(
-        '--start_overlap', 
+        '--start-overlap', 
         type=float, 
-        default=0.45, 
+        default=0.4, 
         help='min overlap to start tracking once person is in seat')
     #vis parameters
     parser.add_argument(
@@ -175,6 +131,16 @@ def parse_args():
         '--draw-bbox', 
         action='store_true', 
         help='Draw bboxes of instances')
+    parser.add_argument(
+        '--draw-pose', 
+        action='store_true', 
+        default=False,
+        help='Draw bboxes of instances')
+    parser.add_argument(
+        '--wait-time',
+        type=int,
+        default=1,
+        help='The interval of show (s), 0 is block')
     
     args = parser.parse_args()
     return args
@@ -204,10 +170,6 @@ def main():
         cfg_options=dict(
             model=dict(test_cfg=dict(output_heatmaps=args.draw_heatmap))))
     
-    #face and head pose detector
-    cfg = OmegaConf.load(args.face_config)
-    analyzer = FaceAnalyzer(cfg.analyzer)
-
     # build visualizer
     pose_estimator.cfg.visualizer.radius = args.radius
     pose_estimator.cfg.visualizer.alpha = args.alpha
@@ -218,10 +180,26 @@ def main():
     hide_kpts = np.append(np.arange(0,5),np.arange(11,23))
 
     #seat detect
-    with open(f"{args.video}.json",'r') as f:
-        bbox_seat = {a['label']:np.array(a['points']).flatten() for a in json.load(f)["shapes"]}
-        seat_labels = sorted(bbox_seat)
-        bbox_seat = np.stack([bbox_seat[l] for l in seat_labels],axis=0)
+    ann = json.load(open(f"{args.video}.json",'r'))
+    bbox_seat = {}
+    mask_seat = {}
+    for a in ann["shapes"]:
+        im = np.zeros((ann['imageHeight'],ann['imageWidth']),dtype=bool)
+        bbox = np.array(a['points']).astype(int).flatten()
+        if not a['mask'] is None:
+            mask = img_b64_to_arr(a['mask'])
+            im[bbox[1]:bbox[3]+1,bbox[0]:bbox[2]+1] = mask
+        if a['label'] in ['aisle', 'middle', 'window']: 
+            bbox_seat[a['label']] = bbox
+            mask_seat[a['label']] = im
+        elif a['label'] == 'shutter':
+            mask_wind = im
+            bbox_wind = bbox
+      
+    seat_labels = sorted(bbox_seat)
+    bbox_seat = np.stack([bbox_seat[l] for l in seat_labels],axis=0)
+    mask_seat = np.stack([mask_seat[l] for l in seat_labels],axis=0)
+    ref_image = img_b64_to_arr(ann['imageData'])
 
     #video reader
     video_reader = mmcv.VideoReader(args.video)
@@ -234,6 +212,9 @@ def main():
         pred_instances_list = []
     frame_nums = list(np.arange(int(args.start_second*video_reader.fps), len(video_reader),int(args.skip_seconds*video_reader.fps)))
 
+    # Setup a pose estimator to solve pose.
+    head_pose_estimator = HeadPoseEstimator(video_reader.width, video_reader.height)
+
     #tracker
     tracker = BYTETracker(args, frame_rate=video_reader.fps)
     seat_id = []
@@ -245,7 +226,6 @@ def main():
         preds = result.pred_instances
         labels = np.array(preds.labels.squeeze().cpu())
         preds = preds[labels==0] #filter only person
-        
         #track
         if len(preds) != 0:
             online_targets = tracker.update(preds)
@@ -266,9 +246,12 @@ def main():
 
                 #determine which seat
                 online_ids = np.array(online_ids)
-                overlaps = bbox_overlaps(preds.bboxes,bbox_seat)
+                overlaps = mask_iou(preds.masks,mask_seat)
                 keep = (np.any(overlaps>args.start_overlap,axis=1) | np.array([id in seat_id for id in online_ids])) \
                         & np.any(overlaps>args.min_overlap,axis=1)  
+                keep1 = np.zeros_like(keep)
+                keep1[np.argmax(overlaps,axis=0)] = True
+                keep = keep & keep1
                 seat_id = np.unique(np.append(seat_id, online_ids[keep]))
                 seat_label = np.argmax(overlaps,axis=1)
                 preds = preds[keep]
@@ -276,41 +259,53 @@ def main():
                     
             # predict keypoints
             preds = preds[preds.scores>args.bbox_thr]
+            vis_boxes = preds.bboxes
+            vis_labels = []
+            vis_names = []
             if len(preds) != 0:
                 pose_results = inference_topdown(pose_estimator, mmcv.bgr2rgb(frame), preds.bboxes)
                 pred_instances = merge_data_samples(pose_results)
-                face = analyzer.run(
-                    image=frame,
-                    batch_size=8,
-                    include_tensors=True,
-                    return_img_data=False,
-                    fix_img_size = False
-                )
-                head_pose = [f.preds['align'].other['pose'] for f in face.faces]
-                for p in head_pose:
-                    yaw,pitch,roll = p['angles']
-                    x,y,_ = p['translation'].cpu().numpy()
-                    in_box = [in_bbox(p.bboxes[0,:],(x,y)) for p in preds]
-                    if np.any(in_box):
-                        frame = draw_axis(frame,yaw,pitch,roll,x,y)
+                #frame = ref_image[...,::-1].copy()
+                for n,pred in enumerate(pose_results):
+                    face = pred.pred_instances.keypoints[0,23:91,:]
+                    hands = pred.pred_instances.keypoints[0,91:,:]
+                    head_pose = head_pose_estimator.solve(face)
+                    vis_labels.append(len(vis_names))
+                    rmat, _ = cv2.Rodrigues(head_pose[0])
+                    yaw = cv2.RQDecomp3x3(rmat)[0][1]
+                    if (0>yaw>-45) or (0<yaw<45):
+                        vis_names.append(f'{seat_labels[preds.labels[n]]}: left {int(yaw)}')
+                    elif (-45>yaw>-90) or (45<yaw<90):
+                        vis_names.append(f'{seat_labels[preds.labels[n]]}: forward {int(yaw)}')
+                    elif (-90>yaw>-180) or (90<yaw<180):  
+                        vis_names.append(f'{seat_labels[preds.labels[n]]}: right {int(yaw)}')
+                    else:
+                        vis_names.append(f'{seat_labels[preds.labels[n]]}: {int(yaw)}')
+                    if args.draw_pose:
+                        head_pose_estimator.visualize(frame, head_pose)
+                    if in_mask(mask_wind,hands).sum()>=3:
+                        vis_boxes = np.vstack([vis_boxes,bbox_wind])
+                        vis_labels.append(len(vis_names))
+                        vis_names.append('window touch')
             else:
                 pred_instances = []
-
-
+            
+            frame = mmcv.imshow_det_bboxes(frame,vis_boxes,np.array(vis_labels),vis_names,show=False)
 
             #visualize
-            visualizer.add_datasample(
-                name=args.video,
-                image=frame,
-                data_sample=pred_instances,
-                draw_gt=False,
-                draw_heatmap=args.draw_heatmap,
-                draw_bbox=args.draw_bbox,
-                show_kpt_idx=args.show_kpt_idx,
-                hide_kpts=hide_kpts,
-                skeleton_style=args.skeleton_style,
-                kpt_thr=args.kpt_thr)
-            frame = visualizer.get_image()
+            if args.draw_pose:
+                visualizer.add_datasample(
+                    name=args.video,
+                    image=frame,
+                    data_sample=pred_instances,
+                    draw_gt=False,
+                    draw_heatmap=args.draw_heatmap,
+                    draw_bbox=args.draw_bbox,
+                    show_kpt_idx=args.show_kpt_idx,
+                    hide_kpts=hide_kpts,
+                    skeleton_style=args.skeleton_style,
+                    kpt_thr=args.kpt_thr)
+                frame = visualizer.get_image()
 
             #save
             if args.out_preds:
