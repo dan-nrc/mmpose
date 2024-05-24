@@ -6,26 +6,14 @@ import numpy as np
 class HeadPoseEstimator:
     """Estimate head pose according to the facial landmarks"""
 
-    def __init__(self, image_width, image_height):
+    def __init__(self, camera_matrix, dist_coeefs):
         """Init a pose estimator.
-
-        Args:
-            image_width (int): input image width
-            image_height (int): input image height
         """
-        self.size = (image_height, image_width)
         self.model_points_68 = self._get_full_model_points()
 
         # Camera internals
-        self.focal_length = self.size[1]
-        self.camera_center = (self.size[1] / 2, self.size[0] / 2)
-        self.camera_matrix = np.array(
-            [[self.focal_length, 0, self.camera_center[0]],
-             [0, self.focal_length, self.camera_center[1]],
-             [0, 0, 1]], dtype="double")
-
-        # Assuming no lens distortion
-        self.dist_coeefs = np.zeros((4, 1))
+        self.camera_matrix = camera_matrix
+        self.dist_coeefs = dist_coeefs
 
     def _get_full_model_points(self):
         """Get all 68 3D model points from file"""

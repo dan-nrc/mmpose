@@ -1,20 +1,29 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from argparse import ArgumentParser
-from mmdet.evaluation.functional import bbox_overlaps
 import cv2
-import json_tricks as json
-import mmcv
-from mmengine.utils import track_iter_progress
+import math
+from pathlib import Path
+import os
 import numpy as np
+import json_tricks as json
+import yaml
+from argparse import ArgumentParser
+from box import Box
+import pandas as pd
+
+import mmcv
 from mmcv.transforms import Compose
 from mmpose.apis import inference_topdown
 from mmpose.apis import init_model as init_pose_estimator
 from mmpose.registry import VISUALIZERS
 from mmpose.structures import merge_data_samples, split_instances
 from mmpose.utils import adapt_mmdet_pipeline
-from pose_estimation import HeadPoseEstimator
+from mmdet.evaluation.functional import bbox_overlaps
+from mmengine.utils import track_iter_progress
+
 from utils import *
-import math
+from pose_estimation import HeadPoseEstimator
+import ransac.core as ransac
+from ransac.models.conic_section import ConicSection
 
 try:
     from mmdet.apis import inference_detector, init_detector
@@ -31,13 +40,15 @@ def parse_args():
     Using mmdet to detect the human.
     """
     parser = ArgumentParser(description='MMDetection video demo')
-    parser.add_argument('det_config', help='Config file for detection')
-    parser.add_argument('det_checkpoint', help='Checkpoint file for detection')
-    parser.add_argument('pose_config', help='Config file for pose')
-    parser.add_argument('pose_checkpoint', help='Checkpoint file for pose')
+    parser.add_argument('config', help='Config file')
     parser.add_argument('video', help='Video file')
     parser.add_argument(
         "--start-second", 
+        type=float, 
+        default=0.0, 
+        help="ts of video start")
+    parser.add_argument(
+        "--end-second", 
         type=float, 
         default=0.0, 
         help="ts of video start")
@@ -58,104 +69,38 @@ def parse_args():
     parser.add_argument(
         '--out-preds',
         type=str,
-        help='whether to save predicted results')
-    parser.add_argument(
-        '--bbox-thr',
-        type=float,
-        default=0.3,
-        help='Bounding box score threshold')
-    parser.add_argument(
-        '--kpt-thr',
-        type=float,
-        default=0.3,
-        help='Visualizing keypoint thresholds')
-    # tracking args
-    parser.add_argument(
-        "--track-thresh", 
-        type=float, 
-        default=0.3, 
-        help="tracking confidence threshold")
-    parser.add_argument(
-        "--track-buffer", 
-        type=int, 
-        default=30, 
-        help="the frames for keep lost tracks")
-    parser.add_argument(
-        "--match-thresh", 
-        type=float, 
-        default=0.8, 
-        help="matching threshold for tracking")
-    parser.add_argument(
-        '--min-overlap', 
-        type=float, 
-        default=0.2, 
-        help='min overlap with seat to count as sitting')
-    parser.add_argument(
-        '--start-overlap', 
-        type=float, 
-        default=0.4, 
-        help='min overlap to start tracking once person is in seat')
-    #vis parameters
-    parser.add_argument(
-        '--draw-heatmap',
-        action='store_true',
-        default=False,
-        help='Draw heatmap predicted by the model')
-    parser.add_argument(
-        '--show-kpt-idx',
-        action='store_true',
-        default=False,
-        help='Whether to show the index of keypoints')
-    parser.add_argument(
-        '--skeleton-style',
-        default='mmpose',
-        type=str,
-        choices=['mmpose', 'openpose'],
-        help='Skeleton style selection')
-    parser.add_argument(
-        '--radius',
-        type=int,
-        default=3,
-        help='Keypoint radius for visualization')
-    parser.add_argument(
-        '--thickness',
-        type=int,
-        default=1,
-        help='Link thickness for visualization')
-    parser.add_argument(
-        '--alpha', 
-        type=float, 
-        default=0.8, 
-        help='The transparency of bboxes')
-    parser.add_argument(
-        '--draw-bbox', 
-        action='store_true', 
-        help='Draw bboxes of instances')
-    parser.add_argument(
-        '--draw-pose', 
-        action='store_true', 
-        default=False,
-        help='Draw bboxes of instances')
+        help='Output predicted results')
     parser.add_argument(
         '--wait-time',
         type=int,
         default=1,
         help='The interval of show (s), 0 is block')
-    
+    parser.add_argument(
+        '--draw-pose', 
+        action='store_true', 
+        default=False,
+        help='Draw keypoints of instances')
+
     args = parser.parse_args()
     return args
 
 def main():
     assert has_mmdet, 'Please install mmdet to run the demo.'
-
+    #read configs
     args = parse_args()
-
     assert args.out_video or args.show or args.out_preds, \
         ('Please specify at least one operation with the argument "--out_video" or "--show" or "--out_preds"')
+    with open(args.config) as stream:
+        try:
+            config = Box(yaml.safe_load(stream))
+        except yaml.YAMLError as exc:
+            print(exc)
+
+    video_file = os.path.join(config.inputs.video_dir, args.video)
 
     # build detector
     detector = init_detector(
-        args.det_config, args.det_checkpoint, device='cuda:0')
+        config.models.det_config, config.models.det_checkpoint, device='cuda:0')
     # build test pipeline
     detector.cfg.test_dataloader.dataset.pipeline[
         0].type = 'mmdet.LoadImageFromNDArray'
@@ -164,59 +109,79 @@ def main():
 
     # build pose estimator
     pose_estimator = init_pose_estimator(
-        args.pose_config,
-        args.pose_checkpoint,
-        device='cuda:0',
-        cfg_options=dict(
-            model=dict(test_cfg=dict(output_heatmaps=args.draw_heatmap))))
+        config.models.pose_config,
+        config.models.pose_checkpoint,
+        device='cuda:0')
     
     # build visualizer
-    pose_estimator.cfg.visualizer.radius = args.radius
-    pose_estimator.cfg.visualizer.alpha = args.alpha
-    pose_estimator.cfg.visualizer.line_width = args.thickness
-    visualizer = VISUALIZERS.build(pose_estimator.cfg.visualizer)
-    visualizer.set_dataset_meta(
-        pose_estimator.dataset_meta, skeleton_style=args.skeleton_style)
-    hide_kpts = np.append(np.arange(0,5),np.arange(11,23))
+    if args.draw_pose:
+        pose_estimator.cfg.visualizer.radius = config.vis.radius
+        pose_estimator.cfg.visualizer.alpha = config.vis.alpha
+        pose_estimator.cfg.visualizer.line_width = config.vis.thickness
+        visualizer = VISUALIZERS.build(pose_estimator.cfg.visualizer)
+        visualizer.set_dataset_meta(
+            pose_estimator.dataset_meta, skeleton_style=config.vis.skeleton_style)
+        hide_kpts = np.arange(0,23)
 
-    #seat detect
-    ann = json.load(open(f"{args.video}.json",'r'))
+    #load annotations
+    video_name = Path(video_file).stem
+    annotations = json.load(open(f"{config.inputs.calib_dir}/images/{video_name}.json",'r'))
+    img_shape = (annotations['imageHeight'],annotations['imageWidth'])
     bbox_seat = {}
     mask_seat = {}
-    for a in ann["shapes"]:
-        im = np.zeros((ann['imageHeight'],ann['imageWidth']),dtype=bool)
-        bbox = np.array(a['points']).astype(int).flatten()
-        if not a['mask'] is None:
-            mask = img_b64_to_arr(a['mask'])
-            im[bbox[1]:bbox[3]+1,bbox[0]:bbox[2]+1] = mask
-        if a['label'] in ['aisle', 'middle', 'window']: 
-            bbox_seat[a['label']] = bbox
-            mask_seat[a['label']] = im
-        elif a['label'] == 'shutter':
-            mask_wind = im
+    mask_seat_back =  []
+    bbox_seat_back = []
+    for ann in annotations["shapes"]:
+        mask = shape_to_mask(img_shape, ann['points'])
+        bbox = mask_to_box(mask)
+        if ann['label'] in ['aisle', 'middle', 'window']: 
+            bbox_seat[ann['label']] = bbox
+            mask_seat[ann['label']] = mask
+        elif ann['label'] == 'shutter':
             bbox_wind = bbox
+            mask_wind = mask
+        elif ann['label'] == 'seat':
+            bbox_seat_back.append(bbox)
+            mask_seat_back.append(mask)
       
     seat_labels = sorted(bbox_seat)
     bbox_seat = np.stack([bbox_seat[l] for l in seat_labels],axis=0)
     mask_seat = np.stack([mask_seat[l] for l in seat_labels],axis=0)
-    ref_image = img_b64_to_arr(ann['imageData'])
+    #ref_image = img_b64_to_arr(annotations['imageData'])
 
     #video reader
-    video_reader = mmcv.VideoReader(args.video)
+    video_reader = mmcv.VideoReader(video_file)
     if args.out_video:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         video_writer = cv2.VideoWriter(
             args.out_video, fourcc, video_reader.fps,
             (video_reader.width, video_reader.height))
+    if args.end_second == 0:
+        end_second = len(video_reader)
+    else:
+        end_second = int(args.end_second*video_reader.fps)
+    skip_seconds = int(args.skip_seconds*video_reader.fps)
+    if args.skip_seconds == 0:
+        skip_seconds = 1        
+    frame_nums = list(np.arange(int(args.start_second*video_reader.fps),end_second,skip_seconds))
+
+    #save results
     if args.out_preds:
         pred_instances_list = []
-    frame_nums = list(np.arange(int(args.start_second*video_reader.fps), len(video_reader),int(args.skip_seconds*video_reader.fps)))
+        frame_results_list = []
 
     # Setup a pose estimator to solve pose.
-    head_pose_estimator = HeadPoseEstimator(video_reader.width, video_reader.height)
+    cam_m = np.loadtxt(f"{config.inputs.calib_dir}/calibration/{video_name}_M.txt")
+    cam_d = np.loadtxt(f"{config.inputs.calib_dir}/calibration/{video_name}_D.txt")
+    head_pose_estimator = HeadPoseEstimator(cam_m,cam_d)
+    dir_lim = config.face.direction
+
+    #set up ellipse finder
+    ellipse_estimator = ransac.Modeler(ConicSection, number_of_trials=config.face.ransac_trials, acceptable_error=config.face.ellipse_error)
+    dilation_kernel = np.ones((config.face.face_dilation, config.face.face_dilation), np.uint8) 
 
     #tracker
-    tracker = BYTETracker(args, frame_rate=video_reader.fps)
+    tracker = BYTETracker(config.tracking, frame_rate=video_reader.fps)
     seat_id = []
     for i in track_iter_progress(frame_nums):
         frame = video_reader.get_frame(i)
@@ -247,8 +212,8 @@ def main():
                 #determine which seat
                 online_ids = np.array(online_ids)
                 overlaps = mask_iou(preds.masks,mask_seat)
-                keep = (np.any(overlaps>args.start_overlap,axis=1) | np.array([id in seat_id for id in online_ids])) \
-                        & np.any(overlaps>args.min_overlap,axis=1)  
+                keep = (np.any(overlaps>config.tracking.start_sit_thr,axis=1) | np.array([id in seat_id for id in online_ids])) \
+                        & np.any(overlaps>config.tracking.track_sit_thr,axis=1)  
                 keep1 = np.zeros_like(keep)
                 keep1[np.argmax(overlaps,axis=0)] = True
                 keep = keep & keep1
@@ -258,82 +223,134 @@ def main():
                 preds.labels = seat_label[keep]
                     
             # predict keypoints
-            preds = preds[preds.scores>args.bbox_thr]
-            vis_boxes = preds.bboxes
+            frame_results = {'frame_id':i}
+            vis_boxes = []
             vis_labels = []
             vis_names = []
             if len(preds) != 0:
                 pose_results = inference_topdown(pose_estimator, mmcv.bgr2rgb(frame), preds.bboxes)
-                pred_instances = merge_data_samples(pose_results)
-                #frame = ref_image[...,::-1].copy()
                 for n,pred in enumerate(pose_results):
-                    face = pred.pred_instances.keypoints[0,23:91,:]
-                    hands = pred.pred_instances.keypoints[0,91:,:]
-                    head_pose = head_pose_estimator.solve(face)
                     vis_labels.append(len(vis_names))
-                    rmat, _ = cv2.Rodrigues(head_pose[0])
-                    yaw = cv2.RQDecomp3x3(rmat)[0][1]
-                    if (0>yaw>-45) or (0<yaw<45):
-                        vis_names.append(f'{seat_labels[preds.labels[n]]}: left {int(yaw)}')
-                    elif (-45>yaw>-90) or (45<yaw<90):
-                        vis_names.append(f'{seat_labels[preds.labels[n]]}: forward {int(yaw)}')
-                    elif (-90>yaw>-180) or (90<yaw<180):  
-                        vis_names.append(f'{seat_labels[preds.labels[n]]}: right {int(yaw)}')
+                    vis_boxes.append(preds.bboxes[n])
+                    seat_name = seat_labels[preds.labels[n]]
+                    face = pred.pred_instances.keypoints[0,23:91,:]
+                    face_score = pred.pred_instances.keypoint_scores[0,23:91]
+                    face_dist = np.ptp(face,axis=0)/[preds.bboxes[n][2]-preds.bboxes[n][0],preds.bboxes[n][3]-preds.bboxes[n][1]]
+                    keep_face = np.all(face_dist<config.face.max_proportion) and (face_score.mean()>config.face.kpt_thr)
+                    hands = pred.pred_instances.keypoints[0,91:,:]
+                    hand_score = pred.pred_instances.keypoint_scores[0,91:]
+                    hand_dist = np.append(
+                                    np.ptp(hands[:21],axis=0)/[preds.bboxes[n][2]-preds.bboxes[n][0],preds.bboxes[n][3]-preds.bboxes[n][1]],
+                                    np.ptp(hands[21:],axis=0)/[preds.bboxes[n][2]-preds.bboxes[n][0],preds.bboxes[n][3]-preds.bboxes[n][1]]
+                                )
+                    keep_hand = np.all(hand_dist<config.touch.max_proportion)
+                    frame_results[f'{seat_name} occupied'] = 1
+                    if keep_face:
+                        #face touch
+                        mask_face = np.zeros_like(frame)
+                        face_points = [(tuple(xy),0) for xy in face[:26]]
+                        face_found = False
+                        try:
+                            consensus_conic_section, inliers, outliers = ellipse_estimator.ConsensusModel(face_points)
+                            face_found = True
+                        except ValueError:
+                            pass
+                        if face_found and (consensus_conic_section.ConicSectionType() == 'ellipse'):
+                            center, major, minor, theta = consensus_conic_section.EllipseParameters()
+                            cv2.ellipse(mask_face, (int(center[0]),int(center[1])), (int(major),int(minor)), math.degrees(theta), 0, 360, (255, 255, 255), -1)
+                            mask_face = cv2.dilate(mask_face, dilation_kernel, iterations=1) 
+                            mask_face = (mask_face[:,:,0]!=0) & preds.masks[n]
+                            if mask_face.sum()>0:
+                                bbox_face = mask_to_box(mask_face)
+                        
+                        #face direction
+                        head_pose = head_pose_estimator.solve(face)
+                        rmat, _ = cv2.Rodrigues(head_pose[0])
+                        yaw = cv2.RQDecomp3x3(rmat)[0][1]
+                        if seat_name == 'window':
+                            lim = dir_lim.left if 'L' in video_name else dir_lim.right
+                        elif seat_name == 'middle':
+                            lim = dir_lim.middle
+                        elif seat_name == 'aisle':
+                            lim = dir_lim.right if 'L' in video_name else dir_lim.left
+                        if (yaw<lim.left):
+                            direction = 'left'
+                        elif  (lim.left<=yaw<=lim.right):
+                            direction = 'forward'
+                        elif (lim.right<yaw):
+                            direction = 'right'
+                        vis_names.append(f'{seat_name}: {direction} {int(yaw)}')
+                        frame_results[f'{seat_name} facing'] = direction
+                        frame_results[f'{seat_name} angle'] = int(yaw)
+                        if args.draw_pose:
+                            head_pose_estimator.draw_axes(frame, head_pose)
                     else:
-                        vis_names.append(f'{seat_labels[preds.labels[n]]}: {int(yaw)}')
-                    if args.draw_pose:
-                        head_pose_estimator.visualize(frame, head_pose)
-                    if in_mask(mask_wind,hands).sum()>=3:
-                        vis_boxes = np.vstack([vis_boxes,bbox_wind])
-                        vis_labels.append(len(vis_names))
-                        vis_names.append('window touch')
+                        vis_names.append(f'{seat_name}: low pose')
+
+                    #window touch
+                    if keep_hand:
+                        num_touch = in_mask(mask_wind,hands,hand_score,config.touch.kpt_thr).sum()
+                        if num_touch>=config.touch.wind_min:
+                            vis_boxes.append(bbox_wind)
+                            vis_labels.append(len(vis_names))
+                            vis_names.append('window touch')
+                            frame_results['window touch'] = 1
+                            frame_results['window num touch'] = num_touch
+                        if keep_face:
+                            num_touch = in_mask(mask_face,hands,hand_score,config.touch.kpt_thr).sum()
+                            if num_touch>=config.touch.face_min:
+                                vis_boxes.append(bbox_face)
+                                vis_labels.append(len(vis_names))
+                                vis_names.append('face touch')
+                                frame_results['face touch'] = 1
+                                frame_results['face num touch'] = num_touch
             else:
                 pred_instances = []
             
-            frame = mmcv.imshow_det_bboxes(frame,vis_boxes,np.array(vis_labels),vis_names,show=False)
+            if (args.show or args.out_video) and len(vis_boxes):
+                frame = mmcv.imshow_det_bboxes(frame,np.vstack(vis_boxes),
+                                            np.array(vis_labels),vis_names,show=False)
+                if args.draw_pose:
+                    visualizer.add_datasample(
+                        name=video_file,
+                        image=frame,
+                        data_sample=pred_instances,
+                        hide_kpts=hide_kpts,
+                        kpt_thr=config.vis.kpt_thr,
+                        draw_gt=False,
+                        draw_heatmap=False,
+                        draw_bbox=False,
+                        show_kpt_idx=False)
+                    frame = visualizer.get_image()
 
-            #visualize
-            if args.draw_pose:
-                visualizer.add_datasample(
-                    name=args.video,
-                    image=frame,
-                    data_sample=pred_instances,
-                    draw_gt=False,
-                    draw_heatmap=args.draw_heatmap,
-                    draw_bbox=args.draw_bbox,
-                    show_kpt_idx=args.show_kpt_idx,
-                    hide_kpts=hide_kpts,
-                    skeleton_style=args.skeleton_style,
-                    kpt_thr=args.kpt_thr)
-                frame = visualizer.get_image()
-
-            #save
+            if args.show:
+                mmcv.imshow(frame, video_file, args.wait_time)
+            if args.out_video:
+                video_writer.write(frame)
             if args.out_preds:
                 # save prediction results
+                pred_instances = merge_data_samples(pose_results)
+                pred_instances = pred_instances.get('pred_instances', None)
+                if not (pred_instances is None):
+                    pred_instances.labels = preds.labels
                 pred_instances_list.append(
                     dict(
                         frame_id=i,
-                        instances=split_instances(pred_instances.get('pred_instances', None))))
-            if args.out_video:
-                video_writer.write(frame)
-            if args.show:
-                mmcv.imshow(frame, args.video, args.wait_time)
+                        instances=pred_instances))
+                frame_results_list.append(frame_results)
 
-
-    if video_writer:
-        video_writer.release()
-
+    #end loop
     cv2.destroyAllWindows()
-
+    if args.out_video:
+        video_writer.release()
     if args.out_preds:
-        with open(args.out_preds, 'w') as f:
+        pd.DataFrame(frame_results_list).to_csv(f'{args.out_preds}.csv')
+        with open(f'{args.out_preds}.txt', 'w') as f:
             json.dump(
-                dict(
-                    meta_info=pose_estimator.dataset_meta,
-                    instance_info=pred_instances_list),
+                pred_instances_list,
                 f,
                 indent='\t')
-        print(f'predictions have been saved at {args.pred_save_path}')
+        print(f'predictions have been saved')
 
 
 if __name__ == '__main__':

@@ -1,0 +1,42 @@
+models: 
+  det_config: /home/kyrollosd/Documents/openmmlab/mmdetection/projects/ViTDet/configs/vitdet_mask-rcnn_vit-b-mae_lsj-100e.py
+  det_checkpoint: /home/kyrollosd/Documents/openmmlab/mmdetection/weights/vitdet_mask-rcnn_vit-b.pth
+  pose_config: /home/kyrollosd/Documents/openmmlab/mmpose/configs/wholebody_2d_keypoint/rtmpose/cocktail14/rtmw-l_8xb320-270e_cocktail14-384x288.py
+  pose_checkpoint: /home/kyrollosd/Documents/openmmlab/mmpose/weights/rtmw-dw-x-l_simcc-cocktail14_270e-384x288-20231122.pth
+inputs:
+  video_dir: /mnt/FAA/CATR/Pilot/Cabin-aligned
+  calib_dir: /mnt/FAA/CATR/Pilot/Calibration/oak
+tracking:
+  track_thr: 0.3
+  match_thr: 0.8
+  track_buffer: 30
+  start_sit_thr: 0.4 #min overlap to start tracking once person is in seat
+  track_sit_thr: 0.2 #min overlap with seat to count as sitting
+touch:
+  kpt_thr: 0.7
+  max_proportion: 0.3
+  wind_min: 3
+  face_min: 1
+  seat_min: 5
+face:
+  max_proportion: 0.5
+  kpt_thr: 0.5
+  direction:
+    left:
+      left: -60
+      right: -30
+    middle:
+      left: -30
+      right: 30
+    right:
+      left: 30
+      right: 60
+  ellipse_error: 5
+  face_dilation: 7
+  ransac_trials: 100
+vis:
+  kpt_thr: 0.7
+  radius: 3
+  thickness: 1
+  alpha: 0.8
+  skeleton_style: mmpose
