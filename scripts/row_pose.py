@@ -15,9 +15,8 @@ from mmcv.transforms import Compose
 from mmpose.apis import inference_topdown
 from mmpose.apis import init_model as init_pose_estimator
 from mmpose.registry import VISUALIZERS
-from mmpose.structures import merge_data_samples, split_instances
 from mmpose.utils import adapt_mmdet_pipeline
-from mmdet.evaluation.functional import bbox_overlaps
+from mmdet.evaluation.functional import bbox_overlaps as bbox_iou
 from mmengine.utils import track_iter_progress
 
 from utils import *
@@ -151,11 +150,6 @@ def main():
 
     #video reader
     video_reader = mmcv.VideoReader(video_file)
-    if args.out_video:
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        video_writer = cv2.VideoWriter(
-            args.out_video, fourcc, video_reader.fps,
-            (video_reader.width, video_reader.height))
     if args.end_second == 0:
         end_second = len(video_reader)
     else:
@@ -166,9 +160,12 @@ def main():
     frame_nums = list(np.arange(int(args.start_second*video_reader.fps),end_second,skip_seconds))
 
     #save results
-    if args.out_preds:
-        pred_instances_list = []
-        frame_results_list = []
+    frame_results_list = []
+    if args.out_video:
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        video_writer = cv2.VideoWriter(
+            args.out_video, fourcc, int(video_reader.fps/skip_seconds),
+            (video_reader.width, video_reader.height))
 
     # Setup a pose estimator to solve pose.
     cam_m = np.loadtxt(f"{config.inputs.calib_dir}/calibration/{video_name}_M.txt")
@@ -211,16 +208,19 @@ def main():
 
                 #determine which seat
                 online_ids = np.array(online_ids)
-                overlaps = mask_iou(preds.masks,mask_seat)
-                keep = (np.any(overlaps>config.tracking.start_sit_thr,axis=1) | np.array([id in seat_id for id in online_ids])) \
-                        & np.any(overlaps>config.tracking.track_sit_thr,axis=1)  
-                keep1 = np.zeros_like(keep)
-                keep1[np.argmax(overlaps,axis=0)] = True
-                keep = keep & keep1
-                seat_id = np.unique(np.append(seat_id, online_ids[keep]))
-                seat_label = np.argmax(overlaps,axis=1)
-                preds = preds[keep]
-                preds.labels = seat_label[keep]
+                mask_overlaps = mask_iou(preds.masks,mask_seat)
+                keep = (np.any(mask_overlaps>config.tracking.start_sit_thr,axis=1) | np.array([id in seat_id for id in online_ids])) \
+                        & np.any(mask_overlaps>config.tracking.track_sit_thr,axis=1) \
+                        & ((preds.bboxes[:,2]-preds.bboxes[:,0])<(1.75*(bbox_seat[:,2]-bbox_seat[:,0]).mean()))
+                
+                bbox_overlaps = bbox_iou(preds.bboxes,bbox_seat)
+                seat_scores  = np.argsort(-np.max(bbox_overlaps[keep],axis=1))
+                seat_label = np.argmax(bbox_overlaps[keep],axis=1)[seat_scores]
+                _, keep_labels = np.unique(seat_label,return_index=True)
+
+                seat_id = np.unique(np.append(seat_id, online_ids[keep][seat_scores][keep_labels]))
+                preds = preds[keep][seat_scores][keep_labels]
+                preds.labels = seat_label[keep_labels]
                     
             # predict keypoints
             frame_results = {'frame_id':i}
@@ -289,7 +289,7 @@ def main():
 
                     #window touch
                     if keep_hand:
-                        num_touch = in_mask(mask_wind,hands,hand_score,config.touch.kpt_thr).sum()
+                        num_touch = in_mask(mask_wind,hands,hand_score,config.touch.kpt_thr)
                         if num_touch>=config.touch.wind_min:
                             vis_boxes.append(bbox_wind)
                             vis_labels.append(len(vis_names))
@@ -297,13 +297,13 @@ def main():
                             frame_results['window touch'] = 1
                             frame_results['window num touch'] = num_touch
                         if keep_face:
-                            num_touch = in_mask(mask_face,hands,hand_score,config.touch.kpt_thr).sum()
+                            num_touch = in_mask(mask_face,hands,hand_score,config.touch.kpt_thr)
                             if num_touch>=config.touch.face_min:
                                 vis_boxes.append(bbox_face)
                                 vis_labels.append(len(vis_names))
                                 vis_names.append('face touch')
-                                frame_results['face touch'] = 1
-                                frame_results['face num touch'] = num_touch
+                                frame_results[f'{seat_name} face touch'] = 1
+                                frame_results[f'{seat_name} num touch'] = num_touch
             else:
                 pred_instances = []
             
@@ -327,30 +327,16 @@ def main():
                 mmcv.imshow(frame, video_file, args.wait_time)
             if args.out_video:
                 video_writer.write(frame)
-            if args.out_preds:
-                # save prediction results
-                pred_instances = merge_data_samples(pose_results)
-                pred_instances = pred_instances.get('pred_instances', None)
-                if not (pred_instances is None):
-                    pred_instances.labels = preds.labels
-                pred_instances_list.append(
-                    dict(
-                        frame_id=i,
-                        instances=pred_instances))
-                frame_results_list.append(frame_results)
+            frame_results_list.append(frame_results)
 
     #end loop
     cv2.destroyAllWindows()
     if args.out_video:
         video_writer.release()
+        print('video have been saved')
     if args.out_preds:
-        pd.DataFrame(frame_results_list).to_csv(f'{args.out_preds}.csv')
-        with open(f'{args.out_preds}.txt', 'w') as f:
-            json.dump(
-                pred_instances_list,
-                f,
-                indent='\t')
-        print(f'predictions have been saved')
+        pd.DataFrame(frame_results_list).to_csv(args.out_preds, index=False)
+        print('predictions have been saved')
 
 
 if __name__ == '__main__':

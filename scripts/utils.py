@@ -66,9 +66,11 @@ def in_mask(mask,pts,scores=None,thr=0):
         pts = pts[scores>thr,:]
     pts = pts.astype(int)
     pts_mask = np.zeros_like(mask)
+    if (pts[:,1]>=mask.shape[0]).any() or (pts[:,0]>=mask.shape[1]).any():
+        return 0
     pts_mask[pts[:,1],pts[:,0]] = 1
     logic = pts_mask & mask
-    return logic
+    return logic.sum()
 
 def mask_iou(mask1, mask2, eps=1e-7):
     """
