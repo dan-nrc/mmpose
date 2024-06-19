@@ -12,6 +12,7 @@ tracking:
   track_buffer: 30
   start_sit_thr: 0.4 #min overlap to start tracking once person is in seat
   track_sit_thr: 0.2 #min overlap with seat to count as sitting
+  max_size: 2 #max size of bbox relative to seat
 touch:
   kpt_thr: 0.7
   max_proportion: 0.3

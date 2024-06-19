@@ -211,7 +211,7 @@ def main():
                 mask_overlaps = mask_iou(preds.masks,mask_seat)
                 keep = (np.any(mask_overlaps>config.tracking.start_sit_thr,axis=1) | np.array([id in seat_id for id in online_ids])) \
                         & np.any(mask_overlaps>config.tracking.track_sit_thr,axis=1) \
-                        & ((preds.bboxes[:,2]-preds.bboxes[:,0])<(1.75*(bbox_seat[:,2]-bbox_seat[:,0]).mean()))
+                        & ((preds.bboxes[:,2]-preds.bboxes[:,0])<(config.tracking.max_size*(bbox_seat[:,2]-bbox_seat[:,0]).mean()))
                 
                 bbox_overlaps = bbox_iou(preds.bboxes,bbox_seat)
                 seat_scores  = np.argsort(-np.max(bbox_overlaps[keep],axis=1))
